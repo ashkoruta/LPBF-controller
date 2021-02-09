@@ -74,6 +74,21 @@ static int loadVectorFromFile(std::vector<double>& in, const std::string& fileNa
 	return 0;
 }
 
+static int dumpToFile(const std::vector<double>& in, const std::string& fileName)
+{
+	writeLog(logOpened, logFile, "Writing to file:" + fileName);
+	std::ofstream out(fileName);
+	if (!out.is_open()) {
+		writeLog(logOpened, logFile, "Failed to open output file");
+		return -1;
+	}
+	for (size_t i = 0; i < in.size(); ++i) {
+		out << in[i] << std::endl;
+	}
+	out.close();
+	return 0;
+}
+
 // generic controller decides what's the power output based on last available measurement & its state (specific)
 class Controller
 {
@@ -103,6 +118,7 @@ public:
 // command a specified power profile in a feedforward manner
 class FeedforwardController : public Controller
 {
+protected:
 	unsigned int _curPosition;
 	std::vector<int> _powerProfile; // power must be an integer, as Scanlab function only accepts int
 	FeedforwardController(const std::vector<double>& pp) { 
@@ -145,19 +161,6 @@ public:
 	virtual int prologue(unsigned int) { return 0; } // generic FF doesn't do anything before or after the scan
 	virtual int epilogue(unsigned int) { return 0; } // generic FF doesn't do anything before or after the scan
 };
-// copy file routine
-//std::ifstream  src("from.ogv", std::ios::binary);
-//std::ofstream  dst("to.ogv",   std::ios::binary);
-//dst << src.rdbuf();
-
-/*L2LController
-int epilogue() {
-	signal = ... smth acquired during all prev calls 
-	p_profile_new = calc(p_profile_cur, signal); // core calculation
-	p_profile_cur = p_profile_new; // reset the profile
-	write(p_file,p_profile_new); // save layer X profile for later use 
-}
-*/
 
 // respond to output changes to track a reference
 class FeedbackController : public Controller
@@ -299,6 +302,82 @@ public:
 		_curPosition = 0; // reset position in reference vector
 		return 0;
 	}
+};
+
+// layer-to-layer controller: feedforward controller that modifies its power profile from layer to layer
+// read-in cfg slightly differently, and dump calculated profile on HDD
+class L2LController : public FeedforwardController
+{
+	std::string _namePrefix;
+	unsigned int _curLayer;
+	std::vector<double> _outputs;
+	L2LController(const std::vector<double>& pp, const std::string& pre, size_t oz) : FeedforwardController(pp), _curLayer(0), _namePrefix(pre), _outputs(oz) {}
+public:
+	static Controller* fromFile(std::ifstream& f) {
+		auto params = parseCfgFile(f);
+		std::string pfile = params["IntialPower"];
+		if (pfile.empty()) {
+			std::stringstream ss;
+			ss << __FUNCTION__ << " : " << "Initial power profile not stated in cfg file";
+			writeLog(logOpened, logFile, ss.str());
+			return nullptr;
+		}
+		std::vector<double> pp;
+		if (loadVectorFromFile(pp, pfile) < 0) {
+			writeLog(logOpened, logFile, "Failed to read in power profile");
+			return nullptr;
+		}
+		std::string n = params["OutputSize"];
+		size_t n_out = 60000;
+		if (n.empty()) {
+			writeLog(logOpened, logFile, "Failed to read in size for output collection, using default 60,000");
+		} else {
+			try {
+				n_out = std::stoi(n);
+			} catch (...) {
+				writeLog(logOpened, logFile, "Incorrect size for output collection, using default 60,000");
+				n_out = 60000;
+			}
+		}
+		std::string pre = params["SavingPrefix"];
+		if (pre.empty()) {
+			writeLog(logOpened, logFile, "Failed to read in prefix to save power profiles");
+		}
+		writeLog(logOpened, logFile, "FF controller initialized: " + std::to_string(pp.size()) + " values");
+		return new L2LController(pp,pre,n_out);
+	}
+	virtual int nextPower(double in) {
+		// save the output value into the stash
+		if (_curPosition >= _outputs.size()) {
+			writeLog(logOpened, logFile, "Too many outputs, buffer ran out");
+		} else {
+			_outputs[_curPosition] = in;
+		}
+		// return the next power; positional counter is incremented within
+		return FeedforwardController::nextPower(in);
+	}
+	virtual int prologue(unsigned int layerNum) {
+		// don't need to do anything special, just note the layer number
+		// bulk of work is done in the epilogue
+		_curLayer = layerNum;
+		return 0;
+	}
+	virtual int epilogue(unsigned int layerNum) {
+		char str[3];
+		sprintf_s(str, "%.3d", this->_curLayer);
+		std::string num(str);
+
+		auto powerToDouble = std::vector<double>(this->_powerProfile.begin(), this->_powerProfile.end());
+		dumpToFile(powerToDouble, this->_namePrefix + "_p" + num + ".txt"); // save layer X profile for later use - sanity check mostly
+		dumpToFile(_outputs, this->_namePrefix + "_y" + num + ".txt"); // save layer X measurement for later use - sanity check mostly
+		// TODO
+		// i can make an update(void) function, that is abstract, and inherit ILC whatever from this
+		//p_profile_new = calc(this->_powerProfile, _outputs); // core calculation
+		//_powerProfile = p_profile_new; // reset the profile
+		_curPosition = 0;
+		return 0; 
+	}
+
 };
 
 // Control dispatching must persist in between DLL function calls
