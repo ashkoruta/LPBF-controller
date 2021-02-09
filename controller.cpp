@@ -79,7 +79,8 @@ class Controller
 {
 public:
 	virtual int nextPower(double in) = 0; // all controllers are SISO
-	virtual void reset() = 0; // reset the controller state at the end of the layer
+	virtual int prologue(unsigned int layerNum) = 0; // before the scan of a part at a layer, specific actions
+	virtual int epilogue(unsigned int layerNum) = 0; // at the end of the scan at a layer, specific actions
 	virtual ~Controller() {}
 };
 
@@ -94,8 +95,9 @@ public:
 		writeLog(logOpened, logFile, "DummyController initialized");
 		return new DummyController;  
 	}
-	virtual int nextPower(double in) { return -1; }
-	virtual void reset() {}
+	virtual int nextPower(double in) { return -1; } // handled outside, in LabVIEW, as "nothing to do"
+	virtual int prologue(unsigned int) { return 0; }
+	virtual int epilogue(unsigned int) { return 0; }
 };
 
 // command a specified power profile in a feedforward manner
@@ -140,7 +142,8 @@ public:
 		writeLog(logOpened, logFile, ss.str());
 		return _powerProfile[_curPosition++];
 	}
-	virtual void reset() {}
+	virtual int prologue(unsigned int) { return 0; } // generic FF doesn't do anything before or after the scan
+	virtual int epilogue(unsigned int) { return 0; } // generic FF doesn't do anything before or after the scan
 };
 // copy file routine
 //std::ifstream  src("from.ogv", std::ios::binary);
@@ -287,11 +290,14 @@ public:
 		writeLog(logOpened, logFile, ss.str());
 		return p;
 	}
-	virtual void reset() {
+	virtual int prologue(unsigned int layerNum) { return 0; } // nothing to do
+	virtual int epilogue(unsigned int layerNum) {
+		// once a scan is done, next layer should be anew. so reset everything to the initial values
 		_prev_power = _P0; // reset integrator
 		_prev_err = 0; // reset history of errors
 		_delayCounter = _initialDelay; // reset delay
 		_curPosition = 0; // reset position in reference vector
+		return 0;
 	}
 };
 
@@ -305,7 +311,7 @@ static ControlDispatcher* CD = nullptr;
 
 class ControlDispatcher
 {
-	unsigned int _prevPathInd; // save previous path index so we can gage when the layer number changes (path index switches from N to 0)
+	unsigned int _prevPathInd;
 	std::vector<Controller*> _ctrls;
 	ControlDispatcher(const std::vector<Controller*>& cs) {
 		_prevPathInd = 0;
@@ -367,13 +373,16 @@ public:
 	int nextPower(unsigned int partNum, double in) {
 		//writeLog(logOpened, logFile, __FUNCTION__);
 		_prevPathInd = partNum;
-		return _ctrls[partNum]->nextPower(in);
+		return _ctrls[partNum]->nextPower(in); // TODO not sure if nextPower within any controller would need layer number?
 	}
-	bool partChange(unsigned int partNum) const {
-		return partNum != _prevPathInd;
+	int prologue(unsigned int layerNum, unsigned int partNum) {
+		_prevPathInd = partNum;
+		return _ctrls[_prevPathInd]->prologue(layerNum);
+
 	}
-	void reset() {
-		_ctrls[_prevPathInd]->reset();
+	int epilogue(unsigned int layerNum, unsigned int partNum) {
+		_prevPathInd = partNum;
+		return _ctrls[_prevPathInd]->epilogue(layerNum);
 	}
 };
 
@@ -423,11 +432,27 @@ extern "C" _declspec(dllexport) int _stdcall nextPower(unsigned int partNum, dou
 		return -1;
 	}
 	//writeLog(logOpened, logFile, __FUNCTION__);
-	if (CD->partChange(partNum)) {
-		// just started new part, so previous controller needs to be reset
-		CD->reset();
-	}
 	return CD->nextPower(partNum, in);
+}
+
+// specific actions before a particular scan starts
+extern "C" _declspec(dllexport) int _stdcall prologue(unsigned int layerNum, unsigned int curPartNum)
+{
+	if (!CD) {
+		writeLog(logOpened, logFile, "Dispatcher wasn't initialized!");
+		return -1;
+	}
+	return CD->prologue(layerNum, curPartNum);
+}
+
+// specific actions in the aftermath of a particular scan
+extern "C" _declspec(dllexport) int _stdcall epilogue(unsigned int layerNum, unsigned int curPartNum)
+{
+	if (!CD) {
+		writeLog(logOpened, logFile, "Dispatcher wasn't initialized!");
+		return -1;
+	}
+	return CD->epilogue(layerNum, curPartNum);
 }
 
 extern "C" _declspec(dllexport) int _stdcall cleanupControllers()

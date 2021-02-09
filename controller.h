@@ -12,3 +12,11 @@ extern "C" _declspec(dllexport) int _stdcall nextPower(unsigned int curPartNum, 
 
 // cleanup after everything is done: call the destructor of the controller dispatching mechanism
 extern "C" _declspec(dllexport) int _stdcall cleanupControllers();
+
+// specific actions before a particular scan starts
+extern "C" _declspec(dllexport) int _stdcall prologue(unsigned int layerNum, unsigned int curPartNum);
+
+// specific actions in the aftermath of a particular scan
+extern "C" _declspec(dllexport) int _stdcall epilogue(unsigned int layerNum, unsigned int curPartNum);
+
+
