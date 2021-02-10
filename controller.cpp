@@ -152,6 +152,7 @@ public:
 			return -1; 
 			// this behavior is different from previous version: here we revert to a value prescribed by scan file
 			// don't hold the last FF value as before
+			// FIXME do we tho? if -1, LV doesn't update power. so it stays as last commanded?
 		}
 		std::stringstream ss;
 		ss << __FUNCTION__ << " : cur=" << _curPosition << " p=" << _powerProfile[_curPosition];
@@ -315,7 +316,7 @@ class L2LController : public FeedforwardController
 public:
 	static Controller* fromFile(std::ifstream& f) {
 		auto params = parseCfgFile(f);
-		std::string pfile = params["IntialPower"];
+		std::string pfile = params["InitialPower"];
 		if (pfile.empty()) {
 			std::stringstream ss;
 			ss << __FUNCTION__ << " : " << "Initial power profile not stated in cfg file";
@@ -343,7 +344,7 @@ public:
 		if (pre.empty()) {
 			writeLog(logOpened, logFile, "Failed to read in prefix to save power profiles");
 		}
-		writeLog(logOpened, logFile, "FF controller initialized: " + std::to_string(pp.size()) + " values");
+		writeLog(logOpened, logFile, "L2L controller initialized: " + std::to_string(pp.size()) + " values");
 		return new L2LController(pp,pre,n_out);
 	}
 	virtual int nextPower(double in) {
@@ -363,17 +364,33 @@ public:
 		return 0;
 	}
 	virtual int epilogue(unsigned int layerNum) {
-		char str[3];
-		sprintf_s(str, "%.3d", this->_curLayer);
-		std::string num(str);
+		std::stringstream ss;
+		ss << __FUNCTION__ << " : curLayer=" << this->_curLayer;
+		writeLog(logOpened, logFile, ss.str());
+		
+		char conv[] = "000";
+		sprintf_s(conv, "%.3d", this->_curLayer);
+		std::string num(conv,3);
 
 		auto powerToDouble = std::vector<double>(this->_powerProfile.begin(), this->_powerProfile.end());
 		dumpToFile(powerToDouble, this->_namePrefix + "_p" + num + ".txt"); // save layer X profile for later use - sanity check mostly
+		// it is possible that buffer for outputs was larger than actual number of calls to nextPower. shrink
+		// TODO what's the correct behavior? say we ran out of P. so P = -1 returned, which is equiv to last commanded power?
+		_outputs.erase(_outputs.begin() + _curPosition, _outputs.end());
 		dumpToFile(_outputs, this->_namePrefix + "_y" + num + ".txt"); // save layer X measurement for later use - sanity check mostly
+		writeLog(logOpened, logFile, "Current power & acquired output saved to disk");
 		// TODO
-		// i can make an update(void) function, that is abstract, and inherit ILC whatever from this
-		//p_profile_new = calc(this->_powerProfile, _outputs); // core calculation
+		// i can make an update(void) function, that is abstract, and inherit ILC/whatever from this
+		// it actually doesn't need any inputs - member function operates on the class
+		// p_new = calc();
 		//_powerProfile = p_profile_new; // reset the profile
+		
+		// within that calc(), I'd do 
+		// for ILC: return _powerProfile + L* (_outputs - ref); 
+		// for MST: prep (x,y,t) nominal, _power_profile, _outputs, t_outputs? x,y,t nominal for next layer
+		// feed it into external C function
+		// got the list of powers out, update
+		
 		_curPosition = 0;
 		return 0; 
 	}
@@ -418,13 +435,15 @@ public:
 		if (type == "FB") {
 			return FeedbackController::fromFile(cfg);
 		}
-		else if (type == "FF") {
+		if (type == "FF") {
 			return FeedforwardController::fromFile(cfg);
-		// ... other possible options...
-		} else {
-			writeLog(logOpened, logFile, "Controller type [" + type + "] unrecognized");
-			return nullptr;
 		}
+		if (type == "L2L") {
+			return L2LController::fromFile(cfg);
+		}
+		// ... other possible options...
+		writeLog(logOpened, logFile, "Controller type [" + type + "] unrecognized");
+		return nullptr;
 	}
 	// main initialization routine: get list of controller cfg files, go one by one, 
 	// call specific controller initializers based on a type stated in each file
