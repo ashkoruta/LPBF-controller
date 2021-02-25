@@ -385,6 +385,19 @@ public:
 		// p_new = calc();
 		//_powerProfile = p_profile_new; // reset the profile
 		
+		// hardcode some update (not config-related), so I can check the whole shabang on the machine
+		double ref = 23.43;
+		std::vector<int> p(_outputs.size(), -1);
+		for (size_t i = 0; i < _outputs.size(); ++i) {
+			if (i >= _powerProfile.size()) {
+				std::stringstream ss;
+				ss << __FUNCTION__ << ": more outputs than powers from _powerProfile";
+				writeLog(logOpened, logFile, ss.str());
+				break;
+			}
+			p[i] = _powerProfile[i] + 0.1 * (_outputs[i] - ref);
+		}
+		_powerProfile = p;
 		// within that calc(), I'd do 
 		// for ILC: return _powerProfile + L* (_outputs - ref); 
 		// for MST: prep (x,y,t) nominal, _power_profile, _outputs, t_outputs? x,y,t nominal for next layer
