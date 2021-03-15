@@ -385,7 +385,7 @@ public:
 		// p_new = calc();
 		//_powerProfile = p_profile_new; // reset the profile
 		
-		// hardcode some update (not config-related), so I can check the whole shabang on the machine
+		// TEMPORARY: hardcode some update (not config-related), so I can check the whole shabang on the machine
 		double ref = 23.43;
 		std::vector<int> p(_outputs.size(), -1);
 		for (size_t i = 0; i < _outputs.size(); ++i) {
@@ -498,14 +498,15 @@ public:
 };
 
 // interface exposed to Labview: controller initialization
-extern "C" _declspec(dllexport) int _stdcall initControllers(unsigned int partNum, const char* cfgFileName)
+extern "C" _declspec(dllexport) int _stdcall initControllers(unsigned int partNum, const char* cfgFileName, int enableLog)
 {
-	if (!logOpened) {
+	// TODO it could be good idea to put logging into control cfg but that's future work
+	if (enableLog) {
 		logFile.open(logFileName, std::ios::app);
 		logOpened = logFile.is_open();
-	}
-	if (!logOpened) {
-		return -3;
+		if (!logOpened) {
+			return -3;
+		}
 	}
 	// open high-level config file
 	std::ifstream cfg(cfgFileName);
