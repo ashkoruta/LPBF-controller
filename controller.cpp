@@ -475,6 +475,39 @@ public:
 	}
 };
 
+// MS&T layer-to-layer controller: maintains and updates an estimate of y = Gp
+class MSTController : public L2LController
+{
+	virtual void updatePowerProfile() {
+		std::stringstream ss;
+		ss << __FUNCTION__;
+		writeLog(logOpened, logFile, ss.str());
+		// TODO - based on MATLAB scripts once I get stuff
+	}
+protected:
+	// TODO members
+	MSTController() : L2LController() {}
+	int fillOptions(CfgMap& params) {
+		int ret = L2LController::fillOptions(params);
+		if (ret < 0)
+			return ret;
+		// additional stuff 
+		// TODO parse the cfg file 
+		return 0;
+	}
+public:
+	static Controller* fromFile(std::ifstream& f) {
+		auto params = parseCfgFile(f);
+		auto ctrl = new MSTController;
+		int ret = ctrl->fillOptions(params);
+		if (ret < 0) {
+			delete ctrl;
+			return nullptr;
+		}
+		return ctrl;
+	}
+};
+
 // Control dispatching must persist in between DLL function calls
 // so it has to be off the stack but also need to be cleaned up properly
 // for clean up, create separate function that calls delete on a pointer, that 
