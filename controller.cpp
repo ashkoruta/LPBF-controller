@@ -6,6 +6,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <cassert>
 #include <map>
 
 const std::string logFileName = "C:/gateway/control.log";
@@ -31,9 +32,10 @@ static void writeLog(bool enabled, std::ofstream& os, const std::string& str)
 	}
 }
 
-static std::map<std::string, std::string> parseCfgFile(std::ifstream &f)
+typedef std::map<std::string, std::string> CfgMap;
+static CfgMap parseCfgFile(std::ifstream &f)
 {
-	std::map<std::string, std::string> ret;
+	CfgMap ret;
 	std::string line;
 	while (std::getline(f, line)) {
 		std::istringstream ss(line);
@@ -121,28 +123,35 @@ class FeedforwardController : public Controller
 protected:
 	unsigned int _curPosition;
 	std::vector<int> _powerProfile; // power must be an integer, as Scanlab function only accepts int
-	FeedforwardController(const std::vector<double>& pp) { 
-		_curPosition = 0;
-		_powerProfile = std::vector<int>(pp.begin(), pp.end()); // implicit conversion from double to int
-	}
-public:
-	~FeedforwardController() {} // nothing specific to do
-	static Controller* fromFile(std::ifstream& f) {
-		auto params = parseCfgFile(f);
+	FeedforwardController() : _curPosition(0), _powerProfile() {}
+	int fillOptions(CfgMap& params) {
 		std::string pfile = params["Power"];
 		if (pfile.empty()) {
 			std::stringstream ss;
 			ss << __FUNCTION__ << " : " << "Power profile not stated in cfg file";
 			writeLog(logOpened, logFile, ss.str());
-			return nullptr;
+			return -1;
 		}
 		std::vector<double> pp;
 		if (loadVectorFromFile(pp, pfile) < 0) {
 			writeLog(logOpened, logFile, "Failed to read in power profile");
+			return -1;
+		}
+		_powerProfile = std::vector<int>(pp.begin(), pp.end()); // conversion from double to int s.t. Scanlab accepts it
+		writeLog(logOpened, logFile, "FF controller initialized: " + std::to_string(pp.size()) + " values");
+		return 0;
+	}
+public:
+	~FeedforwardController() {} // nothing specific to do
+	static Controller* fromFile(std::ifstream& f) {
+		auto params = parseCfgFile(f);
+		auto ctrl = new FeedforwardController;
+		int ret = ctrl->fillOptions(params);
+		if (ret < 0) {
+			delete ctrl;
 			return nullptr;
 		}
-		writeLog(logOpened, logFile, "FF controller initialized: " + std::to_string(pp.size()) + " values");
-		return new FeedforwardController(pp);
+		return ctrl;
 	}
 	virtual int nextPower(double in) {
 		//writeLog(logOpened, logFile, __FUNCTION__);
@@ -309,28 +318,21 @@ public:
 // read-in cfg slightly differently, and dump calculated profile on HDD
 class L2LController : public FeedforwardController
 {
+	virtual void updatePowerProfile() {} // specific inhereted controllers must define it; can't make it purely virtual b/c want to instantiate the class
+protected:
 	std::string _namePrefix;
 	unsigned int _curLayer;
 	std::vector<double> _outputs;
-	L2LController(const std::vector<double>& pp, const std::string& pre, size_t oz) : FeedforwardController(pp), _curLayer(0), _namePrefix(pre), _outputs(oz) {}
-public:
-	static Controller* fromFile(std::ifstream& f) {
-		auto params = parseCfgFile(f);
-		std::string pfile = params["InitialPower"];
-		if (pfile.empty()) {
-			std::stringstream ss;
-			ss << __FUNCTION__ << " : " << "Initial power profile not stated in cfg file";
-			writeLog(logOpened, logFile, ss.str());
-			return nullptr;
+	L2LController() : FeedforwardController(), _namePrefix(""), _curLayer(), _outputs() {}
+	int fillOptions(CfgMap& params) {
+		int ret = FeedforwardController::fillOptions(params);
+		if (ret < 0) {
+			return -1;
 		}
-		std::vector<double> pp;
-		if (loadVectorFromFile(pp, pfile) < 0) {
-			writeLog(logOpened, logFile, "Failed to read in power profile");
-			return nullptr;
-		}
+		// now L2L specific things
 		std::string n = params["OutputSize"];
 		size_t n_out = 60000;
-		if (n.empty()) {
+		if (n.empty()) { // use default value
 			writeLog(logOpened, logFile, "Failed to read in size for output collection, using default 60,000");
 		} else {
 			try {
@@ -340,12 +342,26 @@ public:
 				n_out = 60000;
 			}
 		}
+		_outputs = std::vector<double>(n_out);
+		// file name prefix for HDD dumps
 		std::string pre = params["SavingPrefix"];
 		if (pre.empty()) {
 			writeLog(logOpened, logFile, "Failed to read in prefix to save power profiles");
 		}
-		writeLog(logOpened, logFile, "L2L controller initialized: " + std::to_string(pp.size()) + " values");
-		return new L2LController(pp,pre,n_out);
+		_namePrefix = pre;
+		writeLog(logOpened, logFile, "L2L controller initialized: " + std::to_string(this->_powerProfile.size()) + " values");
+		return 0;
+	}
+public:
+	static Controller* fromFile(std::ifstream& f) {
+		auto params = parseCfgFile(f);
+		auto ctrl = new L2LController;
+		int ret = ctrl->fillOptions(params);
+		if (ret < 0) {
+			delete ctrl;
+			return nullptr;
+		}
+		return ctrl;
 	}
 	virtual int nextPower(double in) {
 		// save the output value into the stash
@@ -372,42 +388,91 @@ public:
 		sprintf_s(conv, "%.3d", this->_curLayer);
 		std::string num(conv,3);
 
-		auto powerToDouble = std::vector<double>(this->_powerProfile.begin(), this->_powerProfile.end());
-		dumpToFile(powerToDouble, this->_namePrefix + "_p" + num + ".txt"); // save layer X profile for later use - sanity check mostly
+		// save current data to HDD
 		// it is possible that buffer for outputs was larger than actual number of calls to nextPower. shrink
 		// TODO what's the correct behavior? say we ran out of P. so P = -1 returned, which is equiv to last commanded power?
 		_outputs.erase(_outputs.begin() + _curPosition, _outputs.end());
 		dumpToFile(_outputs, this->_namePrefix + "_y" + num + ".txt"); // save layer X measurement for later use - sanity check mostly
-		writeLog(logOpened, logFile, "Current power & acquired output saved to disk");
-		// TODO
-		// i can make an update(void) function, that is abstract, and inherit ILC/whatever from this
-		// it actually doesn't need any inputs - member function operates on the class
-		// p_new = calc();
-		//_powerProfile = p_profile_new; // reset the profile
+		writeLog(logOpened, logFile, "Acquired output saved to disk"); 
+		// TODO epilogue / prologue don't influence RT in-layer control. so logging doesn't ruin anything and should be enabled
 		
-		// TEMPORARY: hardcode some update (not config-related), so I can check the whole shabang on the machine
-		double ref = 23.43;
-		std::vector<int> p(_outputs.size(), -1);
-		for (size_t i = 0; i < _outputs.size(); ++i) {
-			if (i >= _powerProfile.size()) {
-				std::stringstream ss;
-				ss << __FUNCTION__ << ": more outputs than powers from _powerProfile";
-				writeLog(logOpened, logFile, ss.str());
-				break;
-			}
-			p[i] = _powerProfile[i] + 0.1 * (_outputs[i] - ref);
-		}
-		_powerProfile = p;
-		// within that calc(), I'd do 
-		// for ILC: return _powerProfile + L* (_outputs - ref); 
-		// for MST: prep (x,y,t) nominal, _power_profile, _outputs, t_outputs? x,y,t nominal for next layer
-		// feed it into external C function
-		// got the list of powers out, update
+		// calculate & set FF power profile for the next layer
+		this->updatePowerProfile(); 
+
+		// save the new profile to disk
+		auto powerToDouble = std::vector<double>(this->_powerProfile.begin(), this->_powerProfile.end());
+		dumpToFile(powerToDouble, this->_namePrefix + "_p" + num + ".txt");
 		
 		_curPosition = 0;
 		return 0; 
 	}
+};
 
+// iterative learning controller: layer to layer control p_k+1 = Q(p_k + L*e_k)
+// read-in cfg slightly differently, and dump calculated profile on HDD
+class ILCController : public L2LController
+{
+	virtual void updatePowerProfile() {
+		std::stringstream ss;
+		ss << __FUNCTION__;
+		writeLog(logOpened, logFile, ss.str());
+		assert(_powerProfile.size() == _outputs.size());
+		// simple vector summation
+		for (size_t i = 0; i < _powerProfile.size(); ++i) {
+			_powerProfile[i] = double(_powerProfile[i]) + _L * (_R - _outputs[i]);
+		}
+		// TODO add robustness filter Q
+	}
+protected:
+	double _L; // learning gain
+	double _R; // reference value. TODO should probably be a vector for a general case
+	// TODO should have some sort of filtering that I'm not concerned with currently
+	ILCController() : L2LController(), _L(0.0), _R(0.0) {}
+	int fillOptions(CfgMap& params) {
+		int ret = L2LController::fillOptions(params);
+		if (ret < 0)
+			return ret;
+		// additional stuff 
+		// gain
+		std::string Ls = params["Gain"];
+		if (Ls.empty()) {
+			writeLog(logOpened, logFile, "Gain is not defined in ILC controller cfg");
+			return -1; // gain must be defined
+		}
+		try {
+			_L = std::stod(Ls);
+		} catch (...) {
+			writeLog(logOpened, logFile, "Gain is not a number in ILC controller cfg");
+			return -1; // gain must be defined
+		}
+		// reference level
+		std::string Rs = params["Reference"];
+		if (Rs.empty()) {
+			writeLog(logOpened, logFile, "Reference is not defined in ILC controller cfg");
+			return -1; // gain must be defined
+		}
+		try {
+			_R = std::stod(Rs);
+		}
+		catch (...) {
+			writeLog(logOpened, logFile, "Reference is not a number in ILC controller cfg");
+			return -1; // gain must be defined
+		}
+		// TODO define Q filter somehow
+		return 0;
+	}
+public:
+	static Controller* fromFile(std::ifstream& f) {
+		auto params = parseCfgFile(f);
+		auto ctrl = new ILCController;
+		int ret = ctrl->fillOptions(params); 
+		// TODO all of these functions are very similar, maybe there is a way to reduce copy-paste even more
+		if (ret < 0) {
+			delete ctrl;
+			return nullptr;
+		}
+		return ctrl;
+	}
 };
 
 // Control dispatching must persist in between DLL function calls
@@ -451,8 +516,8 @@ public:
 		if (type == "FF") {
 			return FeedforwardController::fromFile(cfg);
 		}
-		if (type == "L2L") {
-			return L2LController::fromFile(cfg);
+		if (type == "ILC") {
+			return ILCController::fromFile(cfg);
 		}
 		// ... other possible options...
 		writeLog(logOpened, logFile, "Controller type [" + type + "] unrecognized");
