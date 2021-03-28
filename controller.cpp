@@ -10,6 +10,9 @@
 #include <map>
 #include <functional>
 #include <algorithm>
+#include "Adaptive_initialize.h"
+#include "Adaptive_terminate.h"
+#include "Adaptive.h"
 
 const std::string logFileName = "C:/gateway/control.log";
 std::ofstream logFile;
@@ -589,7 +592,7 @@ protected:
 			return -1;
 		}
 		// initialize MATLAB stuff
-		// Adaptive_Initialize();
+		Adaptive_initialize();
 		// anything else?
 		return 0;
 	}
@@ -605,7 +608,7 @@ public:
 		return ctrl;
 	}
 	~MSTController() {
-		//Adaptive_Terminate();
+		Adaptive_terminate();
 	}
 };
 
