@@ -8,6 +8,8 @@
 #include <sstream>
 #include <cassert>
 #include <map>
+#include <functional>
+#include <algorithm>
 
 const std::string logFileName = "C:/gateway/control.log";
 std::ofstream logFile;
@@ -91,6 +93,42 @@ static int dumpToFile(const std::vector<double>& in, const std::string& fileName
 	return 0;
 }
 
+struct ScanData
+{
+	std::vector<double> _x;
+	std::vector<double> _y;
+	std::vector<double> _t;
+	ScanData() : _x(), _y(), _t() {}
+	ScanData(const std::vector<double>& x, const std::vector<double>& y) : _x(x), _y(y) {}
+	const std::vector<double>& x() const {
+		return _x;
+	}
+	const std::vector<double>& y() const {
+		return _y;
+	}
+	const std::vector<double>& t() const {
+		return _t;
+	}
+	int fillData(const std::string& fileName) {
+		writeLog(logOpened, logFile, "Scan file:" + fileName);
+		std::ifstream pp(fileName);
+		if (!pp.is_open()) {
+			writeLog(logOpened, logFile, "Failed to read profile file");
+			return -1;
+		}
+		std::string line;
+		double x = 0, y = 0, t = 0;
+		while (std::getline(pp,line)) {
+			sscanf_s(line.c_str(), "%lf,%lf,%lf", &x, &y, &t); 	// FIXME should prob handle errors better
+			_x.push_back(x);
+			_y.push_back(y);
+			_t.push_back(t);
+		}
+		writeLog(logOpened, logFile, "Scan file parsed");
+		return 0;
+	}
+
+};
 // generic controller decides what's the power output based on last available measurement & its state (specific)
 class Controller
 {
@@ -475,6 +513,41 @@ public:
 	}
 };
 
+// crop the measurement to the true scan (non-zero frames)
+static std::vector<unsigned int> crop(const std::vector<double>& data, int thresh)
+{
+	// TODO I need to decide if I'm going to crop based on fixed indexes or based on hard threshold
+	std::vector<unsigned int> ret; // return [first,last]
+	ret.push_back(0);
+	ret.push_back(data.size() - 1); // by default, all scan data
+	auto c1 = find_if(data.begin(), data.end(), std::bind2nd(std::greater_equal<int>(), thresh));
+	auto c2 = find_if(data.rbegin(), data.rend(), std::bind2nd(std::greater_equal<int>(), thresh));
+	ret[0] = c1 - data.begin();
+	ret[1] = ret[1] - (c2 - data.rbegin());
+	return ret;
+}
+
+// everything MST wants, cropped and aligned
+struct MSTData {
+	ScanData scn;
+	std::vector<int> power;
+	std::vector<double> output;
+};
+
+static MSTData interp2cam(const std::vector<double>& x, const std::vector<double>& y, const std::vector<double>& t,
+						   const std::vector<int>& power, const std::vector<double>& out, unsigned int i1, unsigned int i2)
+{
+	// that's what I do in interpolation section of alignedXYTM
+	// don't really want to redo it
+	auto xi = x; //TODO
+	auto yi = y; //TODO
+	MSTData ret;
+	ret.scn = ScanData(xi, yi);
+	ret.power = power; // TODO  crop/align
+	ret.output = std::vector<double>(out.begin() + i1, out.begin() + i2);
+	return ret;
+}
+
 // MS&T layer-to-layer controller: maintains and updates an estimate of y = Gp
 class MSTController : public L2LController
 {
@@ -482,17 +555,42 @@ class MSTController : public L2LController
 		std::stringstream ss;
 		ss << __FUNCTION__;
 		writeLog(logOpened, logFile, ss.str());
-		// TODO - based on MATLAB scripts once I get stuff
+		// crop the output data s.t. only actual frames are present
+		std::vector<unsigned int> idx = crop(this->_outputs, 100); // FIXME hardcoded threshold
+		// interpolate coordinates to camera timestamps
+		MSTData interp = interp2cam(_scan.x(), _scan.y(), _scan.t(), this->_powerProfile, this->_outputs, idx[0], idx[1]);
+		auto Gnew = _G;
+		auto Pnew = this->_powerProfile; // TODO
+		auto err = this->_outputs; // TODO
+		// calculate stuff
+		// Adaptive(interp.scn._x.data(), interp.scn._y.data(), interp.power.data(), interp.output.data(),_G.data(),Pnew.data(),Gnew.data(),err);
+		// update internal structures
+		this->_powerProfile = Pnew;
+		this->_G = Gnew;
 	}
 protected:
-	// TODO members
+	ScanData _scan; // x,y,t from G-code - never changes
+	std::vector<double> _G; // gain matrix, flattened
+	// TODO other stuff related to hardcoded sizes of vectors
 	MSTController() : L2LController() {}
 	int fillOptions(CfgMap& params) {
 		int ret = L2LController::fillOptions(params);
 		if (ret < 0)
 			return ret;
 		// additional stuff 
-		// TODO parse the cfg file 
+		// read in scan file data
+		std::string scn = params["Scan"];
+		if (scn.empty()) {
+			writeLog(logOpened, logFile, "Scan file name not provided");
+			return -1;
+		}
+		if (_scan.fillData(scn) < 0) {
+			writeLog(logOpened, logFile, "Scan file is bad");
+			return -1;
+		}
+		// initialize MATLAB stuff
+		// Adaptive_Initialize();
+		// anything else?
 		return 0;
 	}
 public:
@@ -505,6 +603,9 @@ public:
 			return nullptr;
 		}
 		return ctrl;
+	}
+	~MSTController() {
+		//Adaptive_Terminate();
 	}
 };
 
@@ -551,6 +652,9 @@ public:
 		}
 		if (type == "ILC") {
 			return ILCController::fromFile(cfg);
+		}
+		if (type == "MST") {
+			return MSTController::fromFile(cfg);
 		}
 		// ... other possible options...
 		writeLog(logOpened, logFile, "Controller type [" + type + "] unrecognized");
