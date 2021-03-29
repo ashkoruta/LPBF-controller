@@ -519,7 +519,9 @@ public:
 // crop the measurement to the true scan (non-zero frames)
 static std::vector<unsigned int> crop(const std::vector<double>& data, int thresh)
 {
-	// TODO I need to decide if I'm going to crop based on fixed indexes or based on hard threshold
+	// need to crop based on hard threshold: first index is steadty after 2nd layer, but end jitters
+	// after 11k frames, 0.1 us trigger jitter accumulates to 1 ms == 2 frames
+	// so unreasonable to expect exact end each time
 	std::vector<unsigned int> ret; // return [first,last]
 	ret.push_back(0);
 	ret.push_back(data.size() - 1); // by default, all scan data
@@ -559,7 +561,7 @@ class MSTController : public L2LController
 		ss << __FUNCTION__;
 		writeLog(logOpened, logFile, ss.str());
 		// crop the output data s.t. only actual frames are present
-		std::vector<unsigned int> idx = crop(this->_outputs, 100); // FIXME hardcoded threshold
+		std::vector<unsigned int> idx = crop(this->_outputs, this->threshold);
 		// interpolate coordinates to camera timestamps
 		MSTData interp = interp2cam(_scan.x(), _scan.y(), _scan.t(), this->_powerProfile, this->_outputs, idx[0], idx[1]);
 		auto Gnew = _G;
@@ -574,6 +576,8 @@ class MSTController : public L2LController
 protected:
 	ScanData _scan; // x,y,t from G-code - never changes
 	std::vector<double> _G; // gain matrix, flattened
+	const unsigned int threshold = 10;  // hardcoded threshold - leave for now; will recompile each time anyway to include MST script updates
+	// IMPORTANT threshold is in signature of interest, NOT max as usual (don't have max here)
 	// TODO other stuff related to hardcoded sizes of vectors
 	MSTController() : L2LController() {}
 	int fillOptions(CfgMap& params) {
