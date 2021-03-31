@@ -10,9 +10,16 @@
 #include <map>
 #include <functional>
 #include <algorithm>
+// MST codegen
 #include "Adaptive_initialize.h"
 #include "Adaptive_terminate.h"
 #include "Adaptive.h"
+// my interpolation codegen
+#include "interp_xy_initialize.h"
+#include "interp_xy_terminate.h"
+#include "interp_xy.h"
+
+
 
 const std::string logFileName = "C:/gateway/control.log";
 std::ofstream logFile;
@@ -516,67 +523,79 @@ public:
 	}
 };
 
-// crop the measurement to the true scan (non-zero frames)
-static std::vector<unsigned int> crop(const std::vector<double>& data, int thresh)
-{
-	// need to crop based on hard threshold: first index is steadty after 2nd layer, but end jitters
-	// after 11k frames, 0.1 us trigger jitter accumulates to 1 ms == 2 frames
-	// so unreasonable to expect exact end each time
-	std::vector<unsigned int> ret; // return [first,last]
-	ret.push_back(0);
-	ret.push_back(data.size() - 1); // by default, all scan data
-	auto c1 = find_if(data.begin(), data.end(), std::bind2nd(std::greater_equal<int>(), thresh));
-	auto c2 = find_if(data.rbegin(), data.rend(), std::bind2nd(std::greater_equal<int>(), thresh));
-	ret[0] = c1 - data.begin();
-	ret[1] = ret[1] - (c2 - data.rbegin());
-	return ret;
-}
-
 // everything MST wants, cropped and aligned
 struct MSTData {
 	ScanData scn;
-	std::vector<int> power;
+	std::vector<double> power;
 	std::vector<double> output;
 };
-
-static MSTData interp2cam(const std::vector<double>& x, const std::vector<double>& y, const std::vector<double>& t,
-						   const std::vector<int>& power, const std::vector<double>& out, unsigned int i1, unsigned int i2)
-{
-	// that's what I do in interpolation section of alignedXYTM
-	// don't really want to redo it
-	auto xi = x; //TODO
-	auto yi = y; //TODO
-	MSTData ret;
-	ret.scn = ScanData(xi, yi);
-	ret.power = power; // TODO  crop/align
-	ret.output = std::vector<double>(out.begin() + i1, out.begin() + i2);
-	return ret;
-}
 
 // MS&T layer-to-layer controller: maintains and updates an estimate of y = Gp
 class MSTController : public L2LController
 {
+	MSTData interp2cam() const {
+		// essentially, alignXYTM equivalent.
+		// crops the output data s.t. only actual frames are present,
+		// then interpolates. it's all MATLAB codegen (by me)
+
+		// allocate buffers for returned vectors
+		MSTData ret;
+		auto v = std::vector<double>(this->_scanLengthConst);
+		ret.scn = ScanData(v,v);
+		ret.power = v;
+		ret.output = v;  // memeory allocation
+
+		int x_sz = 0, y_sz = 0, out_sz = 0, p_sz = 0;
+		double thr = this->_threshold; // conversion
+		const std::vector<double> pint = std::vector<double>(this->_powerProfile.begin(), this->_powerProfile.end()); // implicit conversion
+
+		// call the interpolator
+		interp_xy(this->_outputs.data(), pint.data(),
+			this->_scan.x().data(), this->_scan.y().data(), this->_scan.t().data(), thr,
+			ret.scn._x.data(), &x_sz,
+			ret.scn._y.data(), &y_sz,
+			ret.output.data(), &out_sz,
+			ret.power.data(), &p_sz);
+
+		// trim data based on sizes returned from the interp_xy
+		auto sz = x_sz;
+		assert(x_sz == y_sz);
+		assert(x_sz == p_sz);
+		assert(x_sz == out_sz);
+		ret.scn._x.erase(ret.scn._x.begin() + sz, ret.scn._x.end());
+		ret.scn._y.erase(ret.scn._y.begin() + sz, ret.scn._y.end());
+		ret.power.erase(ret.scn._x.begin() + sz, ret.power.end());
+		ret.output.erase(ret.output.begin() + sz, ret.output.end());
+		return ret;
+	}
+
 	virtual void updatePowerProfile() {
 		std::stringstream ss;
 		ss << __FUNCTION__;
 		writeLog(logOpened, logFile, ss.str());
-		// crop the output data s.t. only actual frames are present
-		std::vector<unsigned int> idx = crop(this->_outputs, this->threshold);
 		// interpolate coordinates to camera timestamps
-		MSTData interp = interp2cam(_scan.x(), _scan.y(), _scan.t(), this->_powerProfile, this->_outputs, idx[0], idx[1]);
+		MSTData interp = this->interp2cam();
 		auto Gnew = _G;
-		auto Pnew = this->_powerProfile; // TODO
-		auto err = this->_outputs; // TODO
+		auto v = std::vector<double>(this->_scanLengthConst); // allocator
+		auto Pnew = v;
+		auto err = v;
 		// calculate stuff
-		// Adaptive(interp.scn._x.data(), interp.scn._y.data(), interp.power.data(), interp.output.data(),_G.data(),Pnew.data(),Gnew.data(),err);
+		Adaptive(interp.scn._x.data(), interp.scn._y.data(), interp.power.data(), interp.output.data(), _G.data(), Pnew.data(), Gnew.data(), err.data());
 		// update internal structures
-		this->_powerProfile = Pnew;
+		this->_powerProfile = std::vector<int>(Pnew.begin(),Pnew.end()); // TODO I'm positive it will return junk; but sort it out later
 		this->_G = Gnew;
+	}
+	void initG() {
+		_G = std::vector<double>(_scanLengthConst * _scanLengthConst);
+		for (size_t i = 0; i < _scanLengthConst; ++i) {
+			_G[i*_scanLengthConst + i] = 1; // initialize diagonal to 1
+		}
 	}
 protected:
 	ScanData _scan; // x,y,t from G-code - never changes
 	std::vector<double> _G; // gain matrix, flattened
-	const unsigned int threshold = 10;  // hardcoded threshold - leave for now; will recompile each time anyway to include MST script updates
+	const unsigned int _threshold = 10;  // hardcoded threshold - leave for now; will recompile each time anyway to include MST script updates
+	unsigned int _scanLengthConst = 1900; // ugly ass constant - length of all the stuff for MATLAB MST func 
 	// IMPORTANT threshold is in signature of interest, NOT max as usual (don't have max here)
 	// TODO other stuff related to hardcoded sizes of vectors
 	MSTController() : L2LController() {}
@@ -591,12 +610,28 @@ protected:
 			writeLog(logOpened, logFile, "Scan file name not provided");
 			return -1;
 		}
-		if (_scan.fillData(scn) < 0) {
+		if (_scan.fillData(scn) < 0) { // fill the scan file coordinates and times into structure
 			writeLog(logOpened, logFile, "Scan file is bad");
 			return -1;
 		}
 		// initialize MATLAB stuff
 		Adaptive_initialize();
+		interp_xy_initialize();
+		// MST things
+		std::string scnLen = params["ScanLengthConst"]; // ultimate constant for power profile length, output measurement length, etc.
+		if (scnLen.empty()) {
+			writeLog(logOpened, logFile, "Ultimate constant not provided");
+			return -1;
+		}
+		try {
+			_scanLengthConst = std::stod(scnLen);
+		}
+		catch (...) {
+			writeLog(logOpened, logFile, "Ultimate constant poorely defined");
+			return -1;
+		} // TODO should prob write helper functions to parse numbers...
+		// initialize gain matrix as eye(N)
+		this->initG();
 		// anything else?
 		return 0;
 	}
@@ -611,8 +646,17 @@ public:
 		}
 		return ctrl;
 	}
+	// FIXME it's pretty hardcoded safety check, need to do better
+	virtual int nextPower(double in) {
+		int p = FeedforwardController::nextPower(in);
+		if (p >= 300) {
+			writeLog(logOpened, logFile, "!!! Power level warning !!!");
+			return 99;
+		}
+	}
 	~MSTController() {
 		Adaptive_terminate();
+		interp_xy_terminate();
 	}
 };
 
