@@ -109,7 +109,7 @@ struct ScanData
 	std::vector<double> _y;
 	std::vector<double> _t;
 	ScanData() : _x(), _y(), _t() {}
-	ScanData(const std::vector<double>& x, const std::vector<double>& y) : _x(x), _y(y) {}
+	ScanData(const std::vector<double>& v) : _x(v), _y(v), _t(v) {}
 	const std::vector<double>& x() const {
 		return _x;
 	}
@@ -205,7 +205,7 @@ public:
 		//writeLog(logOpened, logFile, __FUNCTION__);
 		// don't care about nothin, just move along the profile
 		if (_curPosition == _powerProfile.size()) {
-			writeLog(logOpened, logFile, "Reached the end of power profile");
+			//writeLog(logOpened, logFile, "Reached the end of power profile");
 			return -1; 
 			// this behavior is different from previous version: here we revert to a value prescribed by scan file
 			// don't hold the last FF value as before
@@ -437,20 +437,24 @@ public:
 		std::string num(conv,3);
 
 		// save current data to HDD
-		// it is possible that buffer for outputs was larger than actual number of calls to nextPower. shrink
+		// it is possible that buffer for outputs was larger than actual number of calls to nextPower
 		// TODO what's the correct behavior? say we ran out of P. so P = -1 returned, which is equiv to last commanded power?
-		_outputs.erase(_outputs.begin() + _curPosition, _outputs.end());
+		//_outputs.erase(_outputs.begin() + _curPosition, _outputs.end());
 		dumpToFile(_outputs, this->_namePrefix + "_y" + num + ".txt"); // save layer X measurement for later use - sanity check mostly
-		writeLog(logOpened, logFile, "Acquired output saved to disk"); 
+		writeLog(logOpened, logFile, "Acquired output saved to disk");
+		// save the commanded profile to disk
+		auto powerToDouble = std::vector<double>(this->_powerProfile.begin(), this->_powerProfile.end());
+		dumpToFile(powerToDouble, this->_namePrefix + "_pc" + num + ".txt");
+
 		// TODO epilogue / prologue don't influence RT in-layer control. so logging doesn't ruin anything and should be enabled
 		
 		// calculate & set FF power profile for the next layer
-		this->updatePowerProfile(); 
+		this->updatePowerProfile();
 
-		// save the new profile to disk
-		auto powerToDouble = std::vector<double>(this->_powerProfile.begin(), this->_powerProfile.end());
-		dumpToFile(powerToDouble, this->_namePrefix + "_p" + num + ".txt");
-		
+		// save the next profile to disk
+		powerToDouble = std::vector<double>(this->_powerProfile.begin(), this->_powerProfile.end());
+		dumpToFile(powerToDouble, this->_namePrefix + "_pn" + num + ".txt");
+		// reset the next power counter
 		_curPosition = 0;
 		return 0; 
 	}
@@ -464,7 +468,7 @@ class ILCController : public L2LController
 		std::stringstream ss;
 		ss << __FUNCTION__;
 		writeLog(logOpened, logFile, ss.str());
-		assert(_powerProfile.size() == _outputs.size());
+		assert(_powerProfile.size() <= _outputs.size()); // FIXME I need to sort out this whole "output buffer length vs # of nextPower calls"
 		// simple vector summation
 		for (size_t i = 0; i < _powerProfile.size(); ++i) {
 			_powerProfile[i] = double(_powerProfile[i]) + _L * (_R - _outputs[i]);
@@ -528,6 +532,45 @@ struct MSTData {
 	ScanData scn;
 	std::vector<double> power;
 	std::vector<double> output;
+	std::vector<double> G;
+	// for HDD dump
+	std::string pre; // name prefix
+	int layerNum;
+	// -- methods -- //
+	int dumpToFiles() const {
+		writeLog(logOpened, logFile, __FUNCTION__);
+		// prep file names
+		char conv[] = "000";
+		sprintf_s(conv, "%.3d", this->layerNum);
+		std::string num(conv, 3);
+		auto sfileName = pre + "_scan" + num + ".txt";
+		auto gfileName = pre + "_G" + num + ".txt";
+		writeLog(logOpened, logFile, "Writing to files:" + sfileName + "|" + gfileName);
+
+		// open files
+		std::ofstream sout(sfileName), gout(gfileName);
+		if (!sout.is_open() || !gout.is_open()) {
+			writeLog(logOpened, logFile, "Failed to open output files");
+			return -1;
+		}
+		// dump
+		try {
+			for (size_t i = 0; i < output.size(); ++i) {
+				sout << scn.x().at(i) << "," << scn.y().at(i) << "," << scn.t().at(i) << ","
+					<< power.at(i) << "," << output.at(i) << std::endl;
+			}
+		} catch (std::out_of_range& e) {
+			// this shouldn't happen - all vectors should be same length!
+			writeLog(logOpened, logFile, "!!! SIZE FAILURE ON SCAN DATA & POWER/OUTPUT !!!");
+			return -1; // well, not that it matters tbh
+		}
+		for (size_t i = 0; i < G.size(); ++i) {
+			gout << G[i] << ",";
+		}
+		sout.close();
+		gout.close();
+		return 0;
+	}
 };
 
 // MS&T layer-to-layer controller: maintains and updates an estimate of y = Gp
@@ -537,15 +580,15 @@ class MSTController : public L2LController
 		// essentially, alignXYTM equivalent.
 		// crops the output data s.t. only actual frames are present,
 		// then interpolates. it's all MATLAB codegen (by me)
-
+		writeLog(logOpened, logFile, __FUNCTION__);
 		// allocate buffers for returned vectors
 		MSTData ret;
-		auto v = std::vector<double>(this->_scanLengthConst);
-		ret.scn = ScanData(v,v);
+		auto v = std::vector<double>(this->_outputs.size());
+		ret.scn = ScanData(v);
 		ret.power = v;
-		ret.output = v;  // memeory allocation
+		ret.output = v;  // memory allocation
 
-		int x_sz = 0, y_sz = 0, out_sz = 0, p_sz = 0;
+		int x_sz = 0, y_sz = 0, t_sz = 0, out_sz = 0, p_sz = 0;
 		double thr = this->_threshold; // conversion
 		const std::vector<double> pint = std::vector<double>(this->_powerProfile.begin(), this->_powerProfile.end()); // implicit conversion
 
@@ -554,18 +597,35 @@ class MSTController : public L2LController
 			this->_scan.x().data(), this->_scan.y().data(), this->_scan.t().data(), thr,
 			ret.scn._x.data(), &x_sz,
 			ret.scn._y.data(), &y_sz,
+			ret.scn._t.data(), &t_sz,
 			ret.output.data(), &out_sz,
 			ret.power.data(), &p_sz);
 
+		std::stringstream ss;
+		ss << "interp_xy returned sizes: " << x_sz << "|" << y_sz << "|" << t_sz << "|" << out_sz << "|" << p_sz;
+		writeLog(logOpened, logFile, ss.str());
 		// trim data based on sizes returned from the interp_xy
 		auto sz = x_sz;
 		assert(x_sz == y_sz);
+		assert(x_sz == t_sz);
 		assert(x_sz == p_sz);
 		assert(x_sz == out_sz);
 		ret.scn._x.erase(ret.scn._x.begin() + sz, ret.scn._x.end());
 		ret.scn._y.erase(ret.scn._y.begin() + sz, ret.scn._y.end());
-		ret.power.erase(ret.scn._x.begin() + sz, ret.power.end());
+		ret.scn._t.erase(ret.scn._t.begin() + sz, ret.scn._t.end());
+		ret.power.erase(ret.power.begin() + sz, ret.power.end());
 		ret.output.erase(ret.output.begin() + sz, ret.output.end());
+		// additional stuff that Mizzou wants
+		ret.layerNum = this->_curLayer;
+		ret.pre = this->_namePrefix;
+		ret.G = this->_G;
+
+		// sanity check
+		ss.str(""); // reset
+		ss << "interp_xy end: " << ret.scn.x().size() << "|" << ret.scn.y().size() << "|" << ret.scn.t().size() << "|" << ret.output.size() << "|" << ret.power.size();
+		writeLog(logOpened, logFile, ss.str());
+
+		writeLog(logOpened, logFile, "interp2cam success");
 		return ret;
 	}
 
@@ -573,17 +633,22 @@ class MSTController : public L2LController
 		std::stringstream ss;
 		ss << __FUNCTION__;
 		writeLog(logOpened, logFile, ss.str());
-		// interpolate coordinates to camera timestamps
+		// interpolate coordinates to camera timestamps. prep MST structure
 		MSTData interp = this->interp2cam();
+		// save the inputs for Adaptive for later debug
+		interp.dumpToFiles();
+		// function will return results in the arguments, pre-allocate
 		auto Gnew = _G;
-		auto v = std::vector<double>(this->_scanLengthConst); // allocator
-		auto Pnew = v;
+		auto v = std::vector<double>(this->_scanLengthConst);
+		auto Pnew = std::vector<double>(2*this->_scanLengthConst); // FIXME idiot returns times, too
 		auto err = v;
 		// calculate stuff
-		Adaptive(interp.scn._x.data(), interp.scn._y.data(), interp.power.data(), interp.output.data(), _G.data(), Pnew.data(), Gnew.data(), err.data());
+		Adaptive(interp.scn._x.data(), interp.scn._y.data(), interp.power.data(), interp.output.data(), interp.G.data(),  // IN inputs to the func
+				 Pnew.data(), Gnew.data(), err.data()); // OUT outputs of the func
 		// update internal structures
-		this->_powerProfile = std::vector<int>(Pnew.begin(),Pnew.end()); // TODO I'm positive it will return junk; but sort it out later
+		this->_powerProfile = std::vector<int>(Pnew.begin(), Pnew.begin() + this->_scanLengthConst); // TODO I'm positive it will return junk; but sort it out later
 		this->_G = Gnew;
+		writeLog(logOpened, logFile, "updatePowerProfile success");
 	}
 	void initG() {
 		_G = std::vector<double>(_scanLengthConst * _scanLengthConst);
@@ -595,7 +660,7 @@ protected:
 	ScanData _scan; // x,y,t from G-code - never changes
 	std::vector<double> _G; // gain matrix, flattened
 	const unsigned int _threshold = 10;  // hardcoded threshold - leave for now; will recompile each time anyway to include MST script updates
-	unsigned int _scanLengthConst = 1900; // ugly ass constant - length of all the stuff for MATLAB MST func 
+	unsigned int _scanLengthConst = 0; // ugly ass constant - length of all the stuff for MATLAB MST func 
 	// IMPORTANT threshold is in signature of interest, NOT max as usual (don't have max here)
 	// TODO other stuff related to hardcoded sizes of vectors
 	MSTController() : L2LController() {}
@@ -633,6 +698,7 @@ protected:
 		// initialize gain matrix as eye(N)
 		this->initG();
 		// anything else?
+		writeLog(logOpened, logFile, "MST controller initialized: " + std::to_string(this->_powerProfile.size()) + " values");
 		return 0;
 	}
 public:
@@ -648,11 +714,12 @@ public:
 	}
 	// FIXME it's pretty hardcoded safety check, need to do better
 	virtual int nextPower(double in) {
-		int p = FeedforwardController::nextPower(in);
+		int p = L2LController::nextPower(in);
 		if (p >= 300) {
 			writeLog(logOpened, logFile, "!!! Power level warning !!!");
 			return 99;
 		}
+		return p;
 	}
 	~MSTController() {
 		Adaptive_terminate();
