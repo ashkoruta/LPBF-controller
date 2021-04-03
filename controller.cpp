@@ -213,7 +213,7 @@ public:
 		}
 		std::stringstream ss;
 		ss << __FUNCTION__ << " : cur=" << _curPosition << " p=" << _powerProfile[_curPosition];
-		writeLog(logOpened, logFile, ss.str());
+		//writeLog(logOpened, logFile, ss.str());
 		return _powerProfile[_curPosition++];
 	}
 	virtual int prologue(unsigned int) { return 0; } // generic FF doesn't do anything before or after the scan
@@ -238,7 +238,24 @@ class FeedbackController : public Controller
 	unsigned int _curPosition;
 	unsigned int _delayCounter; 
 
-	FeedbackController() {} // members are set in the fromFile
+	//output filter
+	double _filter_acc;
+	double _weight;
+
+	// jump ignore setting
+	bool _jumpIgnore;
+
+	FeedbackController() {
+		// members are set in the fromFile
+		_reference = std::vector<double>();
+		_initialDelay = 0;
+		_Kp = 0; _Ki = 0; _Kd = 0;
+		_Pmin = 0; _Pmax = 0;
+		_prev_power = 0; _prev_err = 0;
+		_curPosition = 0; _delayCounter = 0;
+		_filter_acc = 0; _weight = 0;
+		_jumpIgnore = false;
+	}
 	const double nextReferenceValue() {
 		double r = _reference[_curPosition];
 		if (_curPosition == _reference.size() - 1) {
@@ -274,6 +291,9 @@ public:
 		std::string pmin = params["Pmin"];
 		std::string pmax = params["Pmax"];
 		std::string nd = params["Delay"];
+		std::string filter = params["Filter"];
+		std::string jumpignore = params["JumpIgnore"];
+
 
 		if (kp.empty() || ki.empty() || kd.empty()) {
 			writeLog(logOpened, logFile, "Check gains, Kp/Ki/Kd is missing");
@@ -290,8 +310,17 @@ public:
 			return nullptr;
 		}
 
-		double Kp, Ki, Kd;
+		if (filter.empty()) {
+			writeLog(logOpened, logFile, "Filter is not specified, set weight to zero");
+		}
+
+		if (jumpignore.empty()) {
+			writeLog(logOpened, logFile, "Jump ignore flag is not specified, set to false");
+		}
+
+		double Kp, Ki, Kd, w = 0;
 		int P0, Pmin, Pmax, Nd;
+		int JumpIgnore = 0;
 		try {
 			Kp = std::stod(kp);
 			Ki = std::stod(ki);
@@ -300,6 +329,10 @@ public:
 			Pmin = std::stoi(pmin);
 			Pmax = std::stoi(pmax);
 			Nd = std::stoi(nd);
+			if (!filter.empty())
+				w = std::stod(filter);
+			if (!jumpignore.empty())
+				JumpIgnore = std::stoi(jumpignore);
 		} catch (...) {
 			writeLog(logOpened, logFile, "Non-numeric garbage in parameters");
 			return nullptr;
@@ -314,13 +347,16 @@ public:
 		fb->_Pmin = Pmin;
 		fb->_P0 = P0;
 
-		fb->_curPosition = 0;
 		fb->_delayCounter = fb->_initialDelay;
-		fb->_prev_err = 0;
 		fb->_prev_power = P0;
 
+		fb->_weight = w;
+
+		fb->_jumpIgnore = JumpIgnore;
+
 		std::stringstream ss;
-		ss << "Nd=" << Nd << " gains=[" << Kp << "," << Ki << "," << Kd << "] powers=[" << P0 << "," << Pmin << "-" << Pmax << "]";
+		ss << "Nd=" << Nd << " gains=[" << Kp << "," << Ki << "," << Kd << "] powers=[" << P0 << "," << Pmin
+			<< "-" << Pmax << "]" << " w=" << w << " JI = " << JumpIgnore;
 		writeLog(logOpened, logFile, "FB controller initialized: " + ss.str());
 		return fb;
 	}
@@ -330,9 +366,21 @@ public:
 			_delayCounter--;
 			return -1; // wait for initial transients to die
 		}
+		if (_jumpIgnore) {
+			// check that this measurement didn't come from a jump
+			// FIXME reasonable level depends on the signal chosen. for now, hardcode some for C_100
+			if (in < 10) {
+				// outlier. do not respond, let RTC5 handle it / keep power same as at the previous step
+				// TODO i could also potentially set delayCounter to something and wait out the transients...
+				return -1;
+			}
+			// otherwise, all good
+		}
 		// get reference value for this moment in time
 		const double rcur = this->nextReferenceValue();
-		const double err = rcur - in;
+		// filter the measurement
+		_filter_acc = (1.0 - _weight)*in + _weight*_filter_acc;
+		const double err = rcur - _filter_acc;
 		// calculate output power
 		// discrete controllers are usually in the form of smth/z-1
 		// so power[k] = Ki*power[k-1] + Kp*e[k] + Kd*e[k-1]
@@ -356,6 +404,7 @@ public:
 		// once a scan is done, next layer should be anew. so reset everything to the initial values
 		_prev_power = _P0; // reset integrator
 		_prev_err = 0; // reset history of errors
+		_filter_acc = 0; // reset output filter
 		_delayCounter = _initialDelay; // reset delay
 		_curPosition = 0; // reset position in reference vector
 		return 0;
