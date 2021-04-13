@@ -688,21 +688,23 @@ class MSTController : public L2LController
 		interp.dumpToFiles();
 		// function will return results in the arguments, pre-allocate
 		auto Gnew = _G;
-		auto v = std::vector<double>(this->_scanLengthConst);
-		auto Pnew = std::vector<double>(2*this->_scanLengthConst); // FIXME idiot returns times, too
+		auto v = std::vector<double>(2*this->_scanLengthConst); // FIXME bad solution to allocation problems
+		// for some reason (prob interpolation), new power in Adaptive is longer than 1669 == _scanLengthConst
+		// so need to allocate longer array for the power profile
+		auto Pnew = v;
 		auto err = v;
 		// calculate stuff
 		Adaptive(interp.scn._x.data(), interp.scn._y.data(), interp.power.data(), interp.output.data(), interp.G.data(),  // IN inputs to the func
-				 Pnew.data(), Gnew.data(), err.data()); // OUT outputs of the func
+				 this->_ref, this->_gamma, Pnew.data(), Gnew.data(), err.data()); // OUT outputs of the func
 		// update internal structures
-		this->_powerProfile = std::vector<int>(Pnew.begin(), Pnew.begin() + this->_scanLengthConst); // TODO I'm positive it will return junk; but sort it out later
+		this->_powerProfile = std::vector<int>(Pnew.begin(), Pnew.end());
 		this->_G = Gnew;
 		writeLog(logOpened, logFile, "updatePowerProfile success");
 	}
 	void initG() {
 		_G = std::vector<double>(_scanLengthConst * _scanLengthConst);
 		for (size_t i = 0; i < _scanLengthConst; ++i) {
-			_G[i*_scanLengthConst + i] = 1; // initialize diagonal to 1
+			_G[i*_scanLengthConst + i] = 0.2*1; // initialize diagonal to the plant gain TODO proper gain power -> output
 		}
 	}
 protected:
@@ -710,6 +712,8 @@ protected:
 	std::vector<double> _G; // gain matrix, flattened
 	const unsigned int _threshold = 10;  // hardcoded threshold - leave for now; will recompile each time anyway to include MST script updates
 	unsigned int _scanLengthConst = 0; // ugly ass constant - length of all the stuff for MATLAB MST func 
+	double _ref = 0; // reference value to track
+	double _gamma = 0; // learning rate for MST function
 	// IMPORTANT threshold is in signature of interest, NOT max as usual (don't have max here)
 	// TODO other stuff related to hardcoded sizes of vectors
 	MSTController() : L2LController() {}
@@ -732,7 +736,7 @@ protected:
 		Adaptive_initialize();
 		interp_xy_initialize();
 		// MST things
-		std::string scnLen = params["ScanLengthConst"]; // ultimate constant for power profile length, output measurement length, etc.
+		std::string scnLen = params["ScanLengthConst"]; // ultimate constant for gain size, internal grid, etc.
 		if (scnLen.empty()) {
 			writeLog(logOpened, logFile, "Ultimate constant not provided");
 			return -1;
@@ -746,6 +750,32 @@ protected:
 		} // TODO should prob write helper functions to parse numbers...
 		// initialize gain matrix as eye(N)
 		this->initG();
+		// define ref value
+		std::string r = params["Ref"];
+		if (r.empty()) {
+			writeLog(logOpened, logFile, "Reference value not provided");
+			return -1;
+		}
+		try {
+			_ref = std::stod(r);
+		}
+		catch (...) {
+			writeLog(logOpened, logFile, "Reference value poorely defined");
+			return -1;
+		}
+		// define  learning rate
+		std::string gamma = params["Gamma"];
+		if (gamma.empty()) {
+			writeLog(logOpened, logFile, "Gamma value not provided");
+			return -1;
+		}
+		try {
+			_gamma = std::stod(gamma);
+		}
+		catch (...) {
+			writeLog(logOpened, logFile, "Gamma value poorely defined");
+			return -1;
+		}
 		// anything else?
 		writeLog(logOpened, logFile, "MST controller initialized: " + std::to_string(this->_powerProfile.size()) + " values");
 		return 0;
